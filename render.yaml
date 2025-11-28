@@ -2,7 +2,7 @@ services:
   - type: web
     name: phishing-api
     env: python
-    buildCommand: ""
-    startCommand: "gunicorn main_api:app --bind 0.0.0.0:$PORT --workers 1 --threads 4"
-    plan: free
-    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn main_api:app --bind 0.0.0.0:$PORT --workers=1"
+    envVars:
+      PYTHON_VERSION: 3.10.13
