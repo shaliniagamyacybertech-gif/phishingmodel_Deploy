@@ -1,7 +1,6 @@
 # main_api.py
 # API-only entrypoint extracted for deployment.
-# This file is provided in addition to the original full notebook file (original_full.py).
-# It runs the Flask API and binds to the PORT environment variable (required by Render).
+# Optimized for Render deployment with lazy loading and better error handling.
 
 import os
 import math
@@ -11,41 +10,65 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# ML / Torch imports
-import torch
-import torch.nn as nn
-from transformers import AutoTokenizer, AutoModel
-
 app = Flask(__name__)
 CORS(app)
 
-# Load the trained model (ensure these files are included in the deployment ZIP)
-model_path = os.path.join(os.path.dirname(__file__), 'phishing_detector_complete.pkl')
-slm_path = os.path.join(os.path.dirname(__file__), 'phishing_detector_complete_slm.pt')
+# Global variables for lazy loading
+ml_model = None
+scaler = None
+slm_model = None
+slm_classifier = None
+tokenizer = None
+device = None
 
-print("\\n🔄 Loading trained model for API...")
-model_data = joblib.load(model_path)
-ml_model = model_data['model']
-scaler = model_data['scaler']
-
-# Load SLM
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-slm_model = AutoModel.from_pretrained("distilbert-base-uncased").to(device)
-slm_model.eval()
-
-slm_classifier = nn.Sequential(
-    nn.Linear(768, 256), nn.ReLU(), nn.Dropout(0.3),
-    nn.Linear(256, 64), nn.ReLU(), nn.Dropout(0.2),
-    nn.Linear(64, 2)
-).to(device)
-
-if os.path.exists(slm_path):
-    checkpoint = torch.load(slm_path, map_location=device)
-    slm_classifier.load_state_dict(checkpoint['classifier'])
-    print("✅ SLM loaded with trained weights")
-else:
-    print("⚠ SLM checkpoint not found; running with default SLM head (untrained)")
+def load_models():
+    """Lazy load models when first needed"""
+    global ml_model, scaler, slm_model, slm_classifier, tokenizer, device
+    
+    if ml_model is not None:
+        return  # Already loaded
+    
+    print("\n🔄 Loading trained models...")
+    
+    try:
+        # Load ML model
+        model_path = os.path.join(os.path.dirname(__file__), 'phishing_detector_complete.pkl')
+        model_data = joblib.load(model_path)
+        ml_model = model_data['model']
+        scaler = model_data['scaler']
+        print("✅ ML model loaded")
+        
+        # Load SLM components
+        import torch
+        import torch.nn as nn
+        from transformers import AutoTokenizer, AutoModel
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"🔧 Using device: {device}")
+        
+        tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        slm_model = AutoModel.from_pretrained("distilbert-base-uncased").to(device)
+        slm_model.eval()
+        
+        slm_classifier = nn.Sequential(
+            nn.Linear(768, 256), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(256, 64), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(64, 2)
+        ).to(device)
+        
+        slm_path = os.path.join(os.path.dirname(__file__), 'phishing_detector_complete_slm.pt')
+        if os.path.exists(slm_path):
+            checkpoint = torch.load(slm_path, map_location=device, weights_only=False)
+            slm_classifier.load_state_dict(checkpoint['classifier'])
+            print("✅ SLM loaded with trained weights")
+        else:
+            print("⚠️  SLM checkpoint not found; running with default SLM head")
+            
+        print("✅ All models loaded successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error loading models: {e}")
+        raise
 
 def entropy(text):
     if not text:
@@ -73,12 +96,14 @@ def extract_features(url):
         'num_letters': sum(c.isalpha() for c in url),
         'num_special': sum(not c.isalnum() for c in url),
         'num_params': url.count('='),
-        'has_ip': 1 if re.search(r'\\d+\\.\\d+\\.\\d+\\.\\d+', domain) else 0
+        'has_ip': 1 if re.search(r'\d+\.\d+\.\d+\.\d+', domain) else 0
     }
     return features
 
 def analyze_with_slm(url):
     try:
+        import torch
+        
         parsed = urlparse(url)
         text = f"URL: {url} | Protocol: {parsed.scheme} | Domain: {parsed.netloc} | Path: {parsed.path}"
 
@@ -100,14 +125,15 @@ def analyze_with_slm(url):
             'slm_confidence': round(max(phishing_prob, legit_prob), 4)
         }
     except Exception as e:
-        print("SLM analysis failed:", e)
+        print(f"⚠️  SLM analysis failed: {e}")
         return None
 
 @app.route('/')
 def home():
     return jsonify({
-        'message': 'Phishing Detection API - Trained and Ready!',
+        'message': 'Phishing Detection API - Ready!',
         'version': '1.0',
+        'status': 'online',
         'endpoints': {
             'health': 'GET /health',
             'predict': 'POST /predict',
@@ -117,14 +143,25 @@ def home():
 
 @app.route('/health')
 def health():
-    return jsonify({
-        'status': 'healthy',
-        'model_loaded': True,
-        'slm_loaded': os.path.exists(slm_path)
-    })
+    try:
+        models_loaded = ml_model is not None
+        return jsonify({
+            'status': 'healthy',
+            'models_loaded': models_loaded,
+            'service': 'phishing-detection-api'
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    # Lazy load models on first prediction request
+    if ml_model is None:
+        load_models()
+    
     data = request.get_json()
     if not data or 'url' not in data:
         return jsonify({'error': 'URL required'}), 400
@@ -165,6 +202,10 @@ def predict():
 
 @app.route('/batch-predict', methods=['POST'])
 def batch_predict():
+    # Lazy load models on first prediction request
+    if ml_model is None:
+        load_models()
+    
     data = request.get_json()
     if not data or 'urls' not in data:
         return jsonify({'error': 'urls array required'}), 400
@@ -194,4 +235,5 @@ def batch_predict():
 
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=PORT)
+    print(f"🚀 Starting Flask app on port {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False)
